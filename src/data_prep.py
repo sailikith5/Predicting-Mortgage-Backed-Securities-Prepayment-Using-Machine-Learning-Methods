@@ -116,11 +116,26 @@ def main():
 
     mac = pd.read_csv(a.macro, parse_dates=["period"]).sort_values("period")
     mac["mkt_rate_chg3"] = mac["mkt_rate"].diff(3)          # recent rate momentum (info known at month t)
+    mac["mkt_rate_chg6"] = mac["mkt_rate"].diff(6)
+    mac["mkt_rate_chg12"] = mac["mkt_rate"].diff(12)
     df = df.merge(mac, on="period", how="left").dropna(subset=["mkt_rate", "unemp", "hpa_yoy"])
-    df["mkt_rate_chg3"] = df["mkt_rate_chg3"].fillna(0)
+    for c in ("mkt_rate_chg3", "mkt_rate_chg6", "mkt_rate_chg12"):
+        df[c] = df[c].fillna(0)
     df["rate_incentive_orig"] = df["orig_interest_rate"] - df["mkt_rate"]
     df["rate_incentive_cur"] = df["current_rate"] - df["mkt_rate"]
     df["refi_ratio"] = df["current_rate"] / df["mkt_rate"].where(df["mkt_rate"] > 0)  # >1 => refinancing is attractive
+    # History / burnout features. Every one looks BACKWARD only (months t-1 and earlier, or t-3, t-6 lags),
+    # so none can see the payoff. Burnout: loans that stayed in the money for long without prepaying are less
+    # likely to prepay later.
+    df = df.sort_values(["loan_id", "period"]).reset_index(drop=True)
+    g = df.groupby("loan_id")["rate_incentive_cur"]
+    df["incentive_lag3"] = g.shift(3).fillna(df["rate_incentive_cur"])
+    df["incentive_lag6"] = g.shift(6).fillna(df["rate_incentive_cur"])
+    df["incentive_chg3"] = df["rate_incentive_cur"] - df["incentive_lag3"]
+    itm = (df["rate_incentive_cur"] >= 0.5).astype("int16")          # refinancing clearly attractive (>= 0.5 pp)
+    df["months_itm_prev"] = itm.groupby(df["loan_id"]).cumsum() - itm  # months in the money before this month
+    df["max_incentive_prev"] = (g.cummax().groupby(df["loan_id"]).shift(1)
+                                .fillna(df["rate_incentive_cur"]))
     month = df["period"].dt.month                            # seasonality of home sales / prepayments
     df["month_sin"] = np.sin(2 * np.pi * month / 12)
     df["month_cos"] = np.cos(2 * np.pi * month / 12)

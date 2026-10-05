@@ -1,88 +1,71 @@
-# Predicting MBS Prepayment with Machine Learning
+# Predicting Mortgage-Backed Securities Prepayment Using Machine Learning
 
-UE24CS352A Machine Learning mini-project. Loan-level prediction of whether a mortgage
-prepays in a given month, replicating and extending Guo, Boccio & Cameron,
-*Predicting Mortgage Backed Securities Prepayment Using Machine Learning Methods* (Stanford CS229, 2021).
+UE24CS352A Machine Learning mini-project (Section E, Problem #55).
+**Team:** Sai Likhith S (PES1UG24AM239) and Srivamshi Chikkireddy (PES1UG24AM287).
 
-**Team:** <Name 1, SRN> · <Name 2, SRN> · Section <X> · Problem # <N>
+Loan-level prediction of whether a mortgage prepays in a given month, following Guo, Boccio & Cameron,
+*Predicting Mortgage Backed Securities Prepayment Using Machine Learning Methods* (Stanford CS229, 2021), plus
+extensions: gradient boosting, a stacked ensemble, an out-of-time split, a leakage ablation, confidence intervals and a
+balance-weighted pool-level (CPR) evaluation. The 2-page write-up is `MBS_Prepayment_Writeup.pdf`.
 
 ## Problem
-Binary classification at loan-month level: `label = 1` if the loan prepays in that month, else `0`
-(about 50:1 class imbalance). Models: Logistic Regression (none/L1/L2), SVM (RBF/poly/sigmoid),
-Gaussian Discriminant Analysis (linear/quadratic), Feed-forward Neural Network, plus two extensions:
-HistGradientBoosting and a soft-vote Ensemble.
+Binary classification at loan-month level: `label = 1` if the loan prepays in full that month, else `0`.
+With the five vintages used here, about 1.25% of loan-months are prepayments (roughly 79:1 imbalance).
+Models: logistic regression (plain/L1/L2), SVM (RBF/poly/sigmoid), Gaussian discriminant analysis (linear/quadratic),
+a feed-forward neural network, gradient boosting and a stacked ensemble.
 
-## Data
-- **Freddie Mac Single Family Loan-Level Dataset** (origination + monthly performance files). Free, needs registration:
-  https://www.freddiemac.com/research/datasets/sf-loanlevel-dataset
-- **Macro data** (FRED): 30-yr mortgage rate, unemployment rate, FHFA house price index (YoY appreciation).
-- Raw data is NOT committed (see `.gitignore`).
+## Data (not committed: licence and size)
+- **Freddie Mac Single Family Loan-Level sample dataset** (free, needs registration):
+  https://www.freddiemac.com/research/datasets/sf-loanlevel-dataset. We used the vintages 2005, 2008, 2012, 2016, 2019.
+- **Macro data** from FRED (downloaded by `src/get_macro.py`): 30-year mortgage rate, unemployment, FHFA house-price index.
+- `data/`, `models/` and trained artefacts are git-ignored; they are rebuilt by the steps below.
 
 ## Setup
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv
+.venv\Scripts\activate          # Windows (Linux/macOS: source .venv/bin/activate)
 pip install -r requirements.txt
 ```
 
-## Run (in order)
+## Run (from the project root, in order)
+Put the unzipped Freddie Mac files anywhere under `data/raw/`, keeping the original names:
+`sample_orig_YYYY.txt` with `sample_perf_YYYY.txt` (or `sample_svcg_YYYY.txt`), or for the full dataset
+`historical_data_YYYYQn.txt` with `historical_data_time_YYYYQn.txt`.
+
 ```bash
-# 1. Put Freddie Mac files under data/raw/ (unzipped .txt files):
-#    sample_orig_YYYY.txt + sample_svcg_YYYY.txt   (sample dataset), or
-#    historical_data_YYYYQn.txt + historical_data_time_YYYYQn.txt   (full dataset)
-
-python src/get_macro.py                       # -> data/macro.csv
-python src/data_prep.py --loans-per-file 3000 # -> data/processed/data.parquet
-python src/eda.py                             # -> results/eda/*.png
-
-python src/train.py --paper-mode              # paper setup (uses current_upb)   -> results/paper, models/paper
-python src/train.py                           # leak-free (prev-month balance)   -> results/leakfree, models/leakfree
-
-python src/predict.py --tag leakfree --n 10   # demo on sample test loans
+python src/get_macro.py                                          # -> data/macro.csv
+python src/data_prep.py --loans-per-file 5000 --split vintage    # -> data/processed/data.parquet
+python src/eda.py                                                # -> results/eda/
+python src/train.py --tune                                       # leak-free (main result) -> results/leakfree
+python src/train.py --tune --paper-mode                          # paper setup with the leak -> results/paper
+python src/predict.py --tag leakfree --n 10                      # live demo on sample test loans
 ```
-Useful flags: `--max-train 500000` (faster), `--skip-svm`, `--skip-nn`, `--epochs 10`.
-
-Stricter, out-of-time evaluation (recommended as the headline result): train on older origination
-vintages, test on the newest ones.
-```bash
-python src/data_prep.py --loans-per-file 3000 --split vintage
-python src/train.py
-```
-
-Dry run without real data: `python tests/make_synthetic.py`, then
-`python src/data_prep.py --raw data/raw_synth --macro data/macro_synth.csv`.
+Flags: `--tune` (hyper-parameter search on validation data), `--boot 200` (bootstrap resamples, 0 = off),
+`--max-train N` (cap training rows), `--skip-svm`, `--skip-nn`, `--epochs N`, `--l1-rows N` (L1 logistic is trained on
+at most N rows because liblinear is slow). Dry run without real data: `python tests/make_synthetic.py`.
 
 ## Method summary
-- Origination + performance merged on loan ID; macro variables joined by month; one-hot categoricals; missing values
-  imputed with training medians; features standardized (train statistics only).
-- Split **by loan ID** 60/20/20 so no loan appears in two splits.
-- Features include rate incentive (loan rate minus market rate), loan age, credit score, LTV/CLTV/DTI, balance
-  features, unemployment, house-price appreciation.
-- Neural net: in→128→256→1, BatchNorm+ReLU, SGD lr 0.1 decayed x0.91/epoch, 30 epochs, BCE with `pos_weight=10`,
-  best-validation-loss checkpoint.
-- SVMs are trained on a subsample (kernel cost grows quadratically) and evaluated on a test subsample.
-- **Imbalance:** accuracy is meaningless at ~50:1, so every model is reported at the default 0.5 cut-off *and* at a
-  cut-off tuned for F1 on the **validation** set (test set never used for tuning), with TPR/TNR, precision, F1,
-  ROC-AUC, PR-AUC and precision/lift in the top 1% of scores. SVMs use `class_weight="balanced"`.
-- **Ensemble:** logistic-regression stacker fitted on validation-set logits of LogReg-L2, QDA, HistGB and the NN.
-- **Pool-level check (MBS view):** average predicted prepay probability per calendar month vs the actual monthly
-  prepay rate on test loans (`results/<mode>/pool_level.png`, correlation + MAE printed).
-- **Extra features:** refinance ratio (loan rate / market rate), 3-month change in mortgage rate, month-of-year
-  seasonality (sin/cos), alongside rate incentive, age, credit, LTV/DTI, balance ratio, unemployment, HPA.
-- **Leakage check:** the paper's top feature is `current_upb`, which may reveal the label (balance is ~0 in the payoff
-  month). `--paper-mode` reproduces the paper; the default replaces it with previous-month balance.
+- Origination + performance files merged on loan ID; macro series joined by month; one-hot categoricals; training
+  medians for missing values; standardisation with training statistics only.
+- **Out-of-time split** (`--split vintage`): oldest 60% of loans (by origination month) train, next 20% validation, newest
+  20% test. No loan is in two splits. (`--split loan` gives the paper's random split by loan ID.)
+- **Features:** rate incentive (loan rate minus market rate), refinance ratio, loan age, credit score, LTV/DTI, balance
+  ratio, delinquency, macro variables, seasonality, and backward-looking history: incentive 3 and 6 months ago,
+  months spent in the money, maximum past incentive (burnout), and 3/6/12-month market-rate change.
+- **Imbalance:** accuracy is misleading at 79:1, so each model is reported at the 0.5 cut-off and at a cut-off tuned for F1
+  on the validation set (the test set is never used for tuning), with TPR/TNR, precision, F1, ROC-AUC, PR-AUC and
+  lift in the top 1% of scores. SVMs use `class_weight="balanced"`.
+- **Tuning (`--tune`):** L2 strength and a random search over gradient-boosting settings, chosen by validation PR-AUC.
+- **Ensemble:** logistic-regression stacker fitted on validation-set logits of LogReg-L2, QDA, boosting and the network.
+- **Confidence intervals:** loan-level bootstrap on the test set (`results/<mode>/ci.csv`), including the paired difference
+  between the ensemble and boosting.
+- **Pool-level evaluation:** monthly prepayment rate (`pool_level.*`) and balance-weighted SMM/CPR (`pool_cpr.*`) of
+  predictions against actuals on test loans. CPR counts full payoffs only on a sample of loans, not a full pool.
+- **Leakage ablation:** the paper's top feature `current_upb` is zero in the payoff month and reveals the label.
+  `--paper-mode` reproduces that setup; the default uses the previous month's balance.
+- Neural network: in-128-256-1, BatchNorm + ReLU, SGD with decaying learning rate, `pos_weight=10`, best-validation checkpoint.
 
 ## Results
-Fill from `results/<mode>/metrics.csv` (use the `val-F1` rows; accuracy, TPR/TNR, precision, recall, F1, ROC-AUC, PR-AUC,
-precision_top1pct, lift_top1pct). Expect `paper` mode to look near-perfect: that is the `current_upb` leak, not skill.
-
-| Model | Accuracy | TPR | TNR | F1 | PR-AUC |
-|---|---|---|---|---|---|
-| ... | | | | | |
-
-## Repo layout
-```
-src/get_macro.py   download macro series        src/train.py    train + evaluate all models
-src/data_prep.py   merge + features + split     src/predict.py  demo inference
-src/eda.py         EDA + PCA plots              src/models.py   PyTorch network
-tests/make_synthetic.py  fake data for a dry run (numbers from it are NOT results)
-```
+Results are written to `results/leakfree/` and `results/paper/` (`metrics.csv`, `ci.csv`, `tuning.json`, `top_features.csv`,
+confusion matrices, PR curves, pool-level plots). The write-up summarises them. Paper-mode scores of about 1.00 are
+the leak, not skill; the leak-free numbers are the real performance.

@@ -100,6 +100,11 @@ def main():
     ap.add_argument("--skip-svm", action="store_true")
     ap.add_argument("--skip-nn", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--tune", action="store_true",
+                    help="light hyper-parameter search (validation PR-AUC) for HistGB and LogReg-L2 strength")
+    ap.add_argument("--tune-iter", type=int, default=10, help="random-search configs for HistGB")
+    ap.add_argument("--boot", type=int, default=200, help="loan-level bootstrap resamples for confidence intervals (0=off)")
+    ap.add_argument("--l1-rows", type=int, default=200000, help="train the (slow) L1 logistic model on at most this many rows")
     a = ap.parse_args()
 
     tag = "paper" if a.paper_mode else "leakfree"
@@ -141,10 +146,36 @@ def main():
         "GDA_Quadratic": QuadraticDiscriminantAnalysis(reg_param=1e-3),
         "HistGB": HistGradientBoostingClassifier(max_iter=200, random_state=a.seed),
     }
+    if a.tune:
+        from sklearn.model_selection import ParameterSampler
+        tune_log = {"LogReg_L2": [], "HistGB": []}
+        best_c, best_ap = 1.0, -1
+        for C in [0.01, 0.1, 1.0, 10.0]:
+            sc = average_precision_score(yva, LogisticRegression(C=C, max_iter=300).fit(Xtr, ytr).predict_proba(Xva)[:, 1])
+            tune_log["LogReg_L2"].append({"C": C, "val_pr_auc": sc}); print(f"  tune LogReg_L2 C={C}: val PR-AUC {sc:.4f}")
+            if sc > best_ap: best_c, best_ap = C, sc
+        sk["LogReg_L2"] = LogisticRegression(C=best_c, max_iter=300)
+        grid = {"learning_rate": [0.03, 0.05, 0.1], "max_leaf_nodes": [15, 31, 63], "min_samples_leaf": [20, 100, 400],
+                "l2_regularization": [0.0, 1.0, 10.0], "class_weight": [None, "balanced"]}
+        hgb = lambda **k: HistGradientBoostingClassifier(max_iter=400, early_stopping=True, n_iter_no_change=15,
+                                                         random_state=a.seed, **k)
+        best_prm, best_ap = {}, -1
+        for prm in ParameterSampler(grid, n_iter=a.tune_iter, random_state=a.seed):
+            t = time.time()
+            sc = average_precision_score(yva, hgb(**prm).fit(Xtr, ytr).predict_proba(Xva)[:, 1])
+            tune_log["HistGB"].append({**prm, "val_pr_auc": sc}); print(f"  tune HistGB {prm}: val PR-AUC {sc:.4f} ({time.time()-t:.0f}s)")
+            if sc > best_ap: best_prm, best_ap = prm, sc
+        sk["HistGB"] = hgb(**best_prm)
+        json.dump({"best_logreg_C": best_c, "best_histgb": best_prm, "log": tune_log},
+                  open(f"{out_r}/tuning.json", "w"), indent=1, default=str)
+        print("  tuned: LogReg_L2 C =", best_c, "| HistGB =", best_prm)
     fitted = {}
     for name, m in sk.items():
         t = time.time()
-        m.fit(Xtr, ytr)
+        Xf, yf = Xtr, ytr
+        if name == "LogReg_L1" and len(ytr) > a.l1_rows:      # liblinear L1 is slow on 500k rows
+            sub = rng.choice(len(ytr), a.l1_rows, replace=False); Xf, yf = Xtr[sub], ytr[sub]
+        m.fit(Xf, yf)
         probs[name] = m.predict_proba(Xte)[:, 1]
         probs_va[name] = m.predict_proba(Xva)[:, 1]
         thresholds[name] = evaluate(name, yte, probs[name], yva, probs_va[name], rows, out_r)
@@ -205,6 +236,54 @@ def main():
         ax.plot(pool.index, pool["actual"] * 100, label="actual"); ax.plot(pool.index, pool["pred"] * 100, label="predicted")
         ax.set_ylabel("monthly prepay rate (%)"); ax.set_title(f"Pool-level, test loans ({tag})")
         ax.legend(); fig.tight_layout(); fig.savefig(f"{out_r}/pool_level.png", dpi=150); plt.close(fig)
+
+    # Balance-weighted pool view (what an MBS investor sees): SMM = prepaid balance / beginning balance,
+    # CPR = 1 - (1 - SMM)^12. Full payoffs only; the test loans are a sample, not a full pool.
+    te = pd.DataFrame({"period": df["period"].values[idx_te], "bal": df["prev_upb"].values[idx_te].astype("float64"),
+                       "y": yte, "p": p_stack}).fillna({"bal": 0})
+    te["act"], te["prd"] = te["y"] * te["bal"], te["p"] * te["bal"]
+    sm = te.groupby("period")[["act", "prd", "bal"]].sum()
+    sm = sm[sm["bal"] > 0]
+    sm["smm_actual"], sm["smm_pred"] = sm["act"] / sm["bal"], sm["prd"] / sm["bal"]
+    sm["cpr_actual"], sm["cpr_pred"] = 1 - (1 - sm["smm_actual"]) ** 12, 1 - (1 - sm["smm_pred"]) ** 12
+    sm[["smm_actual", "smm_pred", "cpr_actual", "cpr_pred"]].to_csv(f"{out_r}/pool_cpr.csv")
+    if len(sm) >= 3:
+        c_corr = float(sm["cpr_actual"].corr(sm["cpr_pred"])); c_mae = float((sm["cpr_actual"] - sm["cpr_pred"]).abs().mean())
+        print(f"  pool CPR (balance-weighted): corr {c_corr:.3f}  MAE {c_mae*100:.2f} pp  over {len(sm)} months")
+        fig, ax = plt.subplots(figsize=(6, 3.2))
+        ax.plot(sm.index, sm["cpr_actual"] * 100, label="actual CPR"); ax.plot(sm.index, sm["cpr_pred"] * 100, label="predicted CPR")
+        ax.set_ylabel("CPR (%)"); ax.set_title(f"Balance-weighted pool CPR, test loans ({tag})")
+        ax.legend(); fig.tight_layout(); fig.savefig(f"{out_r}/pool_cpr.png", dpi=150); plt.close(fig)
+
+    # Loan-level (cluster) bootstrap confidence intervals on the test set: resample LOANS, not rows.
+    if a.boot > 0:
+        lc = pd.factorize(df["loan_id"].values[idx_te])[0]
+        nl = lc.max() + 1
+        names = [k for k in ["LogReg_L2", "HistGB", "NeuralNet", "Ensemble"] if k in probs]
+        acc = {k: {"roc": [], "pr": []} for k in names}; d_roc, d_pr = [], []
+        brng = np.random.default_rng(a.seed)
+        for _ in range(a.boot):
+            w = np.bincount(brng.integers(0, nl, nl), minlength=nl)[lc]
+            m = w > 0
+            if yte[m].sum() == 0:
+                continue
+            r = {}
+            for k in names:
+                r[k] = (roc_auc_score(yte[m], probs[k][m], sample_weight=w[m]),
+                        average_precision_score(yte[m], probs[k][m], sample_weight=w[m]))
+                acc[k]["roc"].append(r[k][0]); acc[k]["pr"].append(r[k][1])
+            d_roc.append(r["Ensemble"][0] - r["HistGB"][0]); d_pr.append(r["Ensemble"][1] - r["HistGB"][1])
+        ci = []
+        for k in names:
+            for met, pt in (("roc_auc", roc_auc_score(yte, probs[k])), ("pr_auc", average_precision_score(yte, probs[k]))):
+                v = np.array(acc[k]["roc" if met == "roc_auc" else "pr"])
+                ci.append(dict(model=k, metric=met, point=pt, ci_low=np.percentile(v, 2.5), ci_high=np.percentile(v, 97.5)))
+        for met, v in (("roc_auc", d_roc), ("pr_auc", d_pr)):
+            v = np.array(v)
+            ci.append(dict(model="Ensemble minus HistGB", metric=met, point=float(np.mean(v)),
+                           ci_low=np.percentile(v, 2.5), ci_high=np.percentile(v, 97.5)))
+        cidf = pd.DataFrame(ci); cidf.to_csv(f"{out_r}/ci.csv", index=False)
+        print("  95% loan-level bootstrap CIs (" + str(len(d_roc)) + " resamples)"); print(cidf.round(4).to_string(index=False))
 
     if not a.skip_svm:  # SVM on a subsample (kernel matrix grows quadratically); class-balanced
         s_tr = rng.choice(len(Xtr), min(a.svm_train, len(Xtr)), replace=False)
